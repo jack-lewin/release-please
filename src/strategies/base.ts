@@ -36,7 +36,7 @@ import {BranchName} from '../util/branch-name';
 import {PullRequestBody, ReleaseData} from '../util/pull-request-body';
 import {PullRequest} from '../pull-request';
 import {CompositeUpdater, mergeUpdates} from '../updaters/composite';
-import {Generic} from '../updaters/generic';
+import {DEFAULT_DATE_FORMAT, Generic} from '../updaters/generic';
 import {GenericJson} from '../updaters/generic-json';
 import {GenericXml} from '../updaters/generic-xml';
 import {PomXml} from '../updaters/java/pom-xml';
@@ -47,6 +47,7 @@ const DEFAULT_CHANGELOG_PATH = 'CHANGELOG.md';
 
 export interface BuildUpdatesOptions {
   changelogEntry: string;
+  skipChangelog?: boolean;
   commits?: ConventionalCommit[];
   newVersion: Version;
   versionsMap: VersionsMap;
@@ -69,6 +70,7 @@ export interface BaseStrategyOptions {
   mainTemplate?: string;
   tagSeparator?: string;
   skipGitHubRelease?: boolean;
+  skipChangelog?: boolean;
   releaseAs?: string;
   changelogNotes?: ChangelogNotes;
   includeComponentInTag?: boolean;
@@ -76,6 +78,7 @@ export interface BaseStrategyOptions {
   pullRequestTitlePattern?: string;
   pullRequestHeader?: string;
   pullRequestFooter?: string;
+  componentNoSpace?: boolean;
   extraFiles?: ExtraFile[];
   versionFile?: string;
   snapshotLabels?: string[]; // Java-only
@@ -83,6 +86,7 @@ export interface BaseStrategyOptions {
   logger?: Logger;
   initialVersion?: string;
   extraLabels?: string[];
+  dateFormat?: string;
 }
 
 /**
@@ -102,6 +106,7 @@ export abstract class BaseStrategy implements Strategy {
   protected changelogHost?: string;
   protected tagSeparator?: string;
   private skipGitHubRelease: boolean;
+  protected skipChangelog: boolean;
   private releaseAs?: string;
   protected includeComponentInTag: boolean;
   protected includeVInTag: boolean;
@@ -109,8 +114,10 @@ export abstract class BaseStrategy implements Strategy {
   readonly pullRequestTitlePattern?: string;
   readonly pullRequestHeader?: string;
   readonly pullRequestFooter?: string;
+  readonly componentNoSpace?: boolean;
   readonly extraFiles: ExtraFile[];
   readonly extraLabels: string[];
+  protected dateFormat: string;
 
   readonly changelogNotes: ChangelogNotes;
 
@@ -134,6 +141,7 @@ export abstract class BaseStrategy implements Strategy {
     this.changelogSections = options.changelogSections;
     this.tagSeparator = options.tagSeparator;
     this.skipGitHubRelease = options.skipGitHubRelease || false;
+    this.skipChangelog = options.skipChangelog || false;
     this.releaseAs = options.releaseAs;
     this.changelogNotes =
       options.changelogNotes || new DefaultChangelogNotes(options);
@@ -142,9 +150,11 @@ export abstract class BaseStrategy implements Strategy {
     this.pullRequestTitlePattern = options.pullRequestTitlePattern;
     this.pullRequestHeader = options.pullRequestHeader;
     this.pullRequestFooter = options.pullRequestFooter;
+    this.componentNoSpace = options.componentNoSpace;
     this.extraFiles = options.extraFiles || [];
     this.initialVersion = options.initialVersion;
     this.extraLabels = options.extraLabels || [];
+    this.dateFormat = options.dateFormat || DEFAULT_DATE_FORMAT;
   }
 
   /**
@@ -292,11 +302,13 @@ export abstract class BaseStrategy implements Strategy {
       'pull request title pattern:',
       this.pullRequestTitlePattern
     );
+    this.logger.debug('componentNoSpace:', this.componentNoSpace);
     const pullRequestTitle = PullRequestTitle.ofComponentTargetBranchVersion(
       component || '',
       this.targetBranch,
       newVersion,
-      this.pullRequestTitlePattern
+      this.pullRequestTitlePattern,
+      this.componentNoSpace
     );
     const branchComponent = await this.getBranchComponent();
     const branchName = branchComponent
@@ -319,13 +331,20 @@ export abstract class BaseStrategy implements Strategy {
     }
     const updates = await this.buildUpdates({
       changelogEntry: releaseNotesBody,
+      skipChangelog: this.skipChangelog,
       newVersion,
       versionsMap,
       latestVersion: latestRelease?.tag.version,
       commits: conventionalCommits,
     });
     const updatesWithExtras = mergeUpdates(
-      updates.concat(...(await this.extraFileUpdates(newVersion, versionsMap)))
+      updates.concat(
+        ...(await this.extraFileUpdates(
+          newVersion,
+          versionsMap,
+          this.dateFormat
+        ))
+      )
     );
     const pullRequestBody = await this.buildPullRequestBody(
       component,
@@ -385,7 +404,8 @@ export abstract class BaseStrategy implements Strategy {
 
   protected async extraFileUpdates(
     version: Version,
-    versionsMap: VersionsMap
+    versionsMap: VersionsMap,
+    dateFormat: string
   ): Promise<Update[]> {
     const extraFileUpdates: Update[] = [];
     for (const extraFile of this.extraFiles) {
@@ -397,7 +417,11 @@ export abstract class BaseStrategy implements Strategy {
               extraFileUpdates.push({
                 path: this.addPath(path),
                 createIfMissing: false,
-                updater: new Generic({version, versionsMap}),
+                updater: new Generic({
+                  version,
+                  versionsMap,
+                  dateFormat: dateFormat,
+                }),
               });
               break;
             case 'json':
@@ -449,7 +473,7 @@ export abstract class BaseStrategy implements Strategy {
           createIfMissing: false,
           updater: new CompositeUpdater(
             new GenericJson('$.version', version),
-            new Generic({version, versionsMap})
+            new Generic({version, versionsMap, dateFormat: dateFormat})
           ),
         });
       } else if (extraFile.endsWith('.yaml') || extraFile.endsWith('.yml')) {
@@ -458,7 +482,7 @@ export abstract class BaseStrategy implements Strategy {
           createIfMissing: false,
           updater: new CompositeUpdater(
             new GenericYaml('$.version', version),
-            new Generic({version, versionsMap})
+            new Generic({version, versionsMap, dateFormat: dateFormat})
           ),
         });
       } else if (extraFile.endsWith('.toml')) {
@@ -467,7 +491,7 @@ export abstract class BaseStrategy implements Strategy {
           createIfMissing: false,
           updater: new CompositeUpdater(
             new GenericToml('$.version', version),
-            new Generic({version, versionsMap})
+            new Generic({version, versionsMap, dateFormat: dateFormat})
           ),
         });
       } else if (extraFile.endsWith('.xml')) {
@@ -477,14 +501,14 @@ export abstract class BaseStrategy implements Strategy {
           updater: new CompositeUpdater(
             // Updates "version" element that is a child of the root element.
             new GenericXml('/*/version', version),
-            new Generic({version, versionsMap})
+            new Generic({version, versionsMap, dateFormat: dateFormat})
           ),
         });
       } else {
         extraFileUpdates.push({
           path: this.addPath(extraFile),
           createIfMissing: false,
-          updater: new Generic({version, versionsMap}),
+          updater: new Generic({version, versionsMap, dateFormat: dateFormat}),
         });
       }
     }
@@ -580,11 +604,13 @@ export abstract class BaseStrategy implements Strategy {
       PullRequestTitle.parse(
         mergedPullRequest.title,
         this.pullRequestTitlePattern,
+        this.componentNoSpace,
         this.logger
       ) ||
       PullRequestTitle.parse(
         mergedPullRequest.title,
         mergedTitlePattern,
+        this.componentNoSpace,
         this.logger
       );
     if (!pullRequestTitle) {
